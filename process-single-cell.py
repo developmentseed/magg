@@ -115,6 +115,7 @@ def process_morton_cell(
 
     print("\n  Reading files from S3...")
     for s3_url in granule_urls:
+        h5obj = None
         try:
             resource_path = s3_url.replace("s3://", "")
 
@@ -197,6 +198,10 @@ def process_morton_cell(
         except Exception as e:
             print(f"  Warning: Error processing {s3_url}: {e}")
             continue
+        finally:
+            # Explicitly close h5coro file handle to prevent memory leak
+            if h5obj is not None:
+                h5obj.close()
 
     print(f"  Processed {files_processed}/{len(granule_urls)} files")
 
@@ -337,7 +342,7 @@ def main():
         help="Path to granule catalog JSON",
     )
     # Default to cell index 127 (cell -6111121) which has 395 granules,
-    # the most of any cell in the catalog for worst-case profiling
+    # the most of any cell in the catalog for worst-case profiling.
     parser.add_argument(
         "--cell-index",
         type=int,
