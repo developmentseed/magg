@@ -1,0 +1,53 @@
+[project]
+name = "magg"
+version = "0.1.0"
+description = ""
+requires-python = ">=3.12"
+
+dependencies = [
+  "notebook",
+  "cartopy",
+  "dask['distributed']",
+  "earthaccess",
+  "numpy",
+  "pandas",
+  "xarray",
+  "healpy",
+  "xdggs",
+  "h5coro",
+  "pyarrow",
+  "geopandas",
+  "mortie",
+]
+
+[dependency-groups]
+dev = [
+  "pytest",
+  "pytest-cov",
+  "ruff",
+  "pyinstrument",
+]
+
+[tool.codespell]
+skip = "uv.lock"
+
+[tool.ruff]
+line-length = 88
+indent-width = 4
+target-version = "py312"
+
+exclude = [
+  ".eggs",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+ignore = ["E402", "E731"]
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
