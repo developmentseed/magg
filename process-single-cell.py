@@ -292,6 +292,7 @@ def run_with_profiling(
     kwargs: dict,
     output_dir: Path,
     mode: Literal["time", "memory"],
+    cell_id: int,
 ) -> Any:
     """Run a function with profiling enabled."""
     if mode == "time":
@@ -302,7 +303,7 @@ def run_with_profiling(
         result = func(*args, **kwargs)
         profiler.stop()
 
-        flamegraph_path = output_dir / "pyinstrument_flamegraph.html"
+        flamegraph_path = output_dir / f"pyinstrument_flamegraph_{cell_id}.html"
         with open(flamegraph_path, "w") as f:
             f.write(profiler.output_html())
         print(f"\nFlamegraph written to: {flamegraph_path}")
@@ -310,11 +311,11 @@ def run_with_profiling(
     else:  # memory
         import memray
 
-        bin_path = output_dir / "memray.bin"
+        bin_path = output_dir / f"memray_{cell_id}.bin"
         with memray.Tracker(bin_path):
             result = func(*args, **kwargs)
 
-        flamegraph_path = output_dir / "memray_flamegraph.html"
+        flamegraph_path = output_dir / f"memray_flamegraph_{cell_id}.html"
         subprocess.run(
             ["memray", "flamegraph", "-o", str(flamegraph_path), str(bin_path)],
             capture_output=True,
@@ -335,11 +336,13 @@ def main():
         default="data/granule_catalog_cycle22_order6.json",
         help="Path to granule catalog JSON",
     )
+    # Default to cell index 127 (cell -6111121) which has 395 granules,
+    # the most of any cell in the catalog for worst-case profiling
     parser.add_argument(
         "--cell-index",
         type=int,
-        default=0,
-        help="Index of cell to profile (default: first cell)",
+        default=127,
+        help="Index of cell to profile (default: 127, cell with most granules)",
     )
     parser.add_argument(
         "--child-order",
@@ -415,6 +418,7 @@ def main():
         kwargs={},
         output_dir=output_dir,
         mode=args.profile,
+        cell_id=sample_morton,
     )
 
     total_time = time.perf_counter() - start_time
