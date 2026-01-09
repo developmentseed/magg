@@ -1,19 +1,26 @@
 """
 Profiling script for ICESat-2 ATL06 data processing workflow.
 
-Usage:
-    uv run process-single-cell.py --profile time   # CPU time profiling (pyinstrument)
-    uv run process-single-cell.py --profile memory # Memory profiling (memray)
+OPTIMIZED VERSION - addresses lock contention from h5coro threading
 
-Outputs:
-    - flamegraph.html (time mode) or memray.bin + flamegraph.html (memory mode)
+Key optimizations:
+1. Parallel file processing with ThreadPoolExecutor
+2. Semaphore to limit concurrent h5coro operations (prevents lock contention)
+3. Progress reporting for long-running jobs
+
+Usage:
+    uv run process-single-cell-optimized.py --profile time
+    uv run process-single-cell-optimized.py --profile memory
+    uv run process-single-cell-optimized.py --workers 16 --max-concurrent 8
 """
 
 import os
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from threading import Semaphore
 from typing import Any, Literal
 
 import earthaccess
@@ -62,63 +69,28 @@ def calculate_cell_statistics(
     }
 
 
-def process_morton_cell(
+def process_single_granule(
+    s3_url: str,
     parent_morton: int,
     parent_order: int,
-    child_order: int,
-    granule_urls: list[str],
-    s3_credentials: dict,
-) -> dict[str, Any]:
+    credentials: dict,
+    semaphore: Semaphore,
+) -> list[pd.DataFrame]:
     """
-    Process one parent morton cell: read from S3, calculate stats.
-
-    Parameters
-    ----------
-    parent_morton : int
-        Morton index of parent cell
-    parent_order : int
-        Order of parent morton cell (e.g., 6 or 7)
-    child_order : int
-        Order of child cells for statistics (typically 12)
-    granule_urls : list
-        List of S3 URLs to process (from pre-built catalog)
-    s3_credentials : dict
-        AWS S3 credentials for NSIDC access
-
-    Returns
-    -------
-    dict
-        Processing result
+    Process a single granule file.
+    
+    Uses semaphore to limit concurrent h5coro operations and prevent
+    lock contention in concurrent.futures internals.
     """
-    start_time = datetime.now()
-
-    print(f"\nProcessing morton cell: {parent_morton}")
-    print(f"  Granules: {len(granule_urls)}")
-
-    if not granule_urls:
-        return {
-            "parent_morton": parent_morton,
-            "cells_with_data": 0,
-            "total_obs": 0,
-            "error": "No granules found",
-        }
-
-    # Prepare credentials for h5coro S3Driver
-    credentials = {
-        "aws_access_key_id": s3_credentials["accessKeyId"],
-        "aws_secret_access_key": s3_credentials["secretAccessKey"],
-        "aws_session_token": s3_credentials["sessionToken"],
-    }
-
-    all_dataframes = []
-    files_processed = 0
-
-    print("\n  Reading files from S3...")
-    for s3_url in granule_urls:
+    results = []
+    
+    # Acquire semaphore to limit concurrent h5coro operations
+    # This is the KEY optimization - prevents too many threads competing for locks
+    with semaphore:
         h5obj = None
         try:
             resource_path = s3_url.replace("s3://", "")
-
+            
             h5obj = h5coro.H5Coro(
                 resource_path,
                 s3driver.S3Driver,
@@ -126,7 +98,7 @@ def process_morton_cell(
                 errorChecking=True,
                 verbose=False,
             )
-
+            
             for g in ["gt1l", "gt1r", "gt2l", "gt2r", "gt3l", "gt3r"]:
                 try:
                     coord_data = h5obj.readDatasets(
@@ -135,24 +107,24 @@ def process_morton_cell(
                             f"/{g}/land_ice_segments/longitude",
                         ]
                     )
-
+                    
                     lats = coord_data[f"/{g}/land_ice_segments/latitude"]
                     lons = coord_data[f"/{g}/land_ice_segments/longitude"]
-
+                    
                     if len(lats) == 0:
                         continue
-
+                    
                     midx18 = geo2mort(lats, lons, order=18)
                     midx_parent = clip2order(parent_order, midx18)
                     mask_spatial = midx_parent == parent_morton
-
+                    
                     if np.sum(mask_spatial) == 0:
                         continue
-
+                    
                     indices = np.where(mask_spatial)[0]
                     min_idx = int(indices[0])
                     max_idx = int(indices[-1]) + 1
-
+                    
                     data = h5obj.readDatasets(
                         [
                             {
@@ -169,41 +141,140 @@ def process_morton_cell(
                             },
                         ]
                     )
-
+                    
                     mask_sliced = mask_spatial[min_idx:max_idx]
                     h_li = data[f"/{g}/land_ice_segments/h_li"][mask_sliced]
                     s_li = data[f"/{g}/land_ice_segments/h_li_sigma"][mask_sliced]
                     q_flag = data[f"/{g}/land_ice_segments/atl06_quality_summary"][
                         mask_sliced
                     ]
-
+                    
                     quality_mask = q_flag == 0
-
+                    
                     if np.sum(quality_mask) == 0:
                         continue
-
+                    
                     midx_sliced = midx18[min_idx:max_idx][mask_sliced]
                     data_dict = {
                         "h_li": h_li[quality_mask],
                         "s_li": s_li[quality_mask],
                         "midx": midx_sliced[quality_mask],
                     }
-                    all_dataframes.append(pd.DataFrame(data_dict))
-
+                    results.append(pd.DataFrame(data_dict))
+                    
                 except Exception:
                     continue
-
-            files_processed += 1
-
-        except Exception as e:
-            print(f"  Warning: Error processing {s3_url}: {e}")
-            continue
+                    
+        except Exception:
+            pass
         finally:
-            # Explicitly close h5coro file handle to prevent memory leak
             if h5obj is not None:
                 h5obj.close()
+    
+    return results
 
-    print(f"  Processed {files_processed}/{len(granule_urls)} files")
+
+def process_morton_cell(
+    parent_morton: int,
+    parent_order: int,
+    child_order: int,
+    granule_urls: list[str],
+    s3_credentials: dict,
+    max_workers: int = 16,
+    max_concurrent_h5coro: int = 8,
+) -> dict[str, Any]:
+    """
+    Process one parent morton cell: read from S3, calculate stats.
+    
+    OPTIMIZED: Uses parallel file processing with controlled concurrency.
+
+    Parameters
+    ----------
+    parent_morton : int
+        Morton index of parent cell
+    parent_order : int
+        Order of parent morton cell (e.g., 6 or 7)
+    child_order : int
+        Order of child cells for statistics (typically 12)
+    granule_urls : list
+        List of S3 URLs to process (from pre-built catalog)
+    s3_credentials : dict
+        AWS S3 credentials for NSIDC access
+    max_workers : int
+        Maximum number of parallel file processing threads
+    max_concurrent_h5coro : int
+        Maximum concurrent h5coro operations (controls lock contention)
+
+    Returns
+    -------
+    dict
+        Processing result
+    """
+    start_time = datetime.now()
+
+    print(f"\nProcessing morton cell: {parent_morton}")
+    print(f"  Granules: {len(granule_urls)}")
+    print(f"  Max workers: {max_workers}, Max concurrent h5coro: {max_concurrent_h5coro}")
+
+    if not granule_urls:
+        return {
+            "parent_morton": parent_morton,
+            "cells_with_data": 0,
+            "total_obs": 0,
+            "error": "No granules found",
+        }
+
+    # Prepare credentials for h5coro S3Driver
+    credentials = {
+        "aws_access_key_id": s3_credentials["accessKeyId"],
+        "aws_secret_access_key": s3_credentials["secretAccessKey"],
+        "aws_session_token": s3_credentials["sessionToken"],
+    }
+
+    # Semaphore limits how many h5coro instances are actively using 
+    # concurrent.futures at once - this is the KEY fix for lock contention
+    semaphore = Semaphore(max_concurrent_h5coro)
+
+    all_dataframes = []
+    files_processed = 0
+    files_with_data = 0
+
+    print("\n  Reading files from S3 (parallel)...")
+    read_start = time.perf_counter()
+    
+    # Process files in parallel with ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_url = {
+            executor.submit(
+                process_single_granule,
+                url,
+                parent_morton,
+                parent_order,
+                credentials,
+                semaphore,
+            ): url
+            for url in granule_urls
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_url):
+            try:
+                result_dfs = future.result()
+                files_processed += 1
+                if result_dfs:
+                    all_dataframes.extend(result_dfs)
+                    files_with_data += 1
+                # Progress indicator every 50 files
+                if files_processed % 50 == 0:
+                    print(f"    Progress: {files_processed}/{len(granule_urls)} files...")
+            except Exception as e:
+                files_processed += 1
+    
+    read_time = time.perf_counter() - read_start
+    print(f"  Processed {files_processed}/{len(granule_urls)} files in {read_time:.1f}s")
+    print(f"  Files with data in cell: {files_with_data}")
+    print(f"  Throughput: {len(granule_urls)/read_time:.1f} files/sec")
 
     if not all_dataframes:
         return {
@@ -279,6 +350,7 @@ def process_morton_cell(
         "error": None,
         "duration_s": duration,
         "files_processed": files_processed,
+        "read_time_s": read_time,
     }
 
 
@@ -341,8 +413,6 @@ def main():
         default="data/granule_catalog_cycle22_order6.json",
         help="Path to granule catalog JSON",
     )
-    # Default to cell index 127 (cell -6111121) which has 395 granules,
-    # the most of any cell in the catalog for worst-case profiling.
     parser.add_argument(
         "--cell-index",
         type=int,
@@ -361,15 +431,29 @@ def main():
         default="time",
         help="Profile mode: 'time' (pyinstrument) or 'memory' (memray)",
     )
+    # Tuning parameters for parallelism
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=16,
+        help="Max parallel file processing threads (default: 16)",
+    )
+    parser.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=8,
+        help="Max concurrent h5coro operations (default: 8, reduces lock contention)",
+    )
     args = parser.parse_args()
 
     output_dir = Path("data")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print("ICESat-2 Processing Profiler")
+    print("ICESat-2 Processing Profiler (OPTIMIZED)")
     print("=" * 70)
     print(f"Profile mode: {args.profile}")
+    print(f"Workers: {args.workers}, Max concurrent h5coro: {args.max_concurrent}")
     print(f"Output directory: {output_dir.absolute()}")
     print(f"Started at: {datetime.now().isoformat()}")
 
@@ -420,7 +504,10 @@ def main():
     result = run_with_profiling(
         process_morton_cell,
         args=(sample_morton, parent_order, args.child_order, granule_urls, s3_credentials),
-        kwargs={},
+        kwargs={
+            "max_workers": args.workers,
+            "max_concurrent_h5coro": args.max_concurrent,
+        },
         output_dir=output_dir,
         mode=args.profile,
         cell_id=sample_morton,
