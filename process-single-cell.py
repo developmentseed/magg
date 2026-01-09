@@ -302,7 +302,7 @@ def run_with_profiling(
         result = func(*args, **kwargs)
         profiler.stop()
 
-        flamegraph_path = output_dir / "flamegraph.html"
+        flamegraph_path = output_dir / "pyinstrument_flamegraph.html"
         with open(flamegraph_path, "w") as f:
             f.write(profiler.output_html())
         print(f"\nFlamegraph written to: {flamegraph_path}")
@@ -314,7 +314,7 @@ def run_with_profiling(
         with memray.Tracker(bin_path):
             result = func(*args, **kwargs)
 
-        flamegraph_path = output_dir / "flamegraph.html"
+        flamegraph_path = output_dir / "memray_flamegraph.html"
         subprocess.run(
             ["memray", "flamegraph", "-o", str(flamegraph_path), str(bin_path)],
             capture_output=True,
