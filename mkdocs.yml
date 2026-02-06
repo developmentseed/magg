@@ -15,6 +15,7 @@ nav:
   - "API":
       - Schema: "api/schema.md"
       - Processing: "api/processing.md"
+      - ATL06: "api/atl06.md"
       - Catalog: "api/catalog.md"
       - Auth: "api/auth.md"
   - "Design":

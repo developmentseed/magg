@@ -5,10 +5,12 @@ This module contains the core processing logic that can be used across different
 cloud platforms or local processing environments.
 """
 
+from __future__ import annotations
+
 import logging
 from collections.abc import Callable
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Protocol, Tuple, runtime_checkable
 
 import h5coro
 import numpy as np
@@ -19,6 +21,110 @@ from zarr.abc.store import Store
 from magg.schema import _DATA_VARS, ProcessingMetadata, _agg_fields, _get_schema_fields
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Granule reader protocol
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class GranuleReader(Protocol):
+    """Interface for reading point-cloud observations from a remote granule.
+
+    A granule reader separates *data access* (file format, dataset paths,
+    credential handling, quality filtering) from the generic *spatial
+    filtering and aggregation* pipeline in
+    [`process_morton_cell`][magg.processing.process_morton_cell].
+
+    Implementations must provide two methods that mirror the two-phase read
+    pattern used for efficient S3 byte-range access:
+
+    1. **`read_coordinates`** --- cheap read of lat/lon arrays so the caller
+       can build a spatial mask *before* fetching heavy data columns.
+    2. **`read_data`** --- read only the rows that survive the spatial mask,
+       apply dataset-specific quality filters, and return a tidy DataFrame.
+
+    A file may contain multiple independent groups of observations (e.g.
+    ICESat-2 ground tracks). Both methods use a *group_index* to address
+    individual groups without the caller needing to know their names.
+
+    Examples
+    --------
+    See [`ATL06Reader`][magg.atl06.ATL06Reader] for a concrete implementation.
+
+    Notes
+    -----
+    This is a :pep:`544` structural protocol --- implementations do **not**
+    need to inherit from ``GranuleReader``.  Any object with matching
+    ``read_coordinates`` and ``read_data`` methods satisfies the interface.
+    """
+
+    def read_coordinates(
+        self,
+        granule_url: str,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Read geographic coordinates for every observation group in a granule.
+
+        This is the *first phase* of the two-phase read.  The returned
+        coordinates are used by the caller to compute morton indices and
+        build a spatial mask --- no data columns are read yet.
+
+        Parameters
+        ----------
+        granule_url : str
+            S3 URL or file path to the granule
+            (e.g. ``s3://nsidc-cumulus.../ATL06_...h5``).
+
+        Returns
+        -------
+        list of (lats, lons) tuples
+            One ``(np.ndarray, np.ndarray)`` pair per observation group.
+            For ATL06 this is six pairs (one per ground track); a simpler
+            product might return a single pair.
+        """
+        ...
+
+    def read_data(
+        self,
+        granule_url: str,
+        group_index: int,
+        row_slice: slice,
+        morton_indices: np.ndarray,
+    ) -> pd.DataFrame | None:
+        """Read data columns for one observation group, applying quality filters.
+
+        This is the *second phase* of the two-phase read.  It is called
+        only for groups and row ranges that survived spatial filtering, so
+        implementations can use ``row_slice`` for efficient byte-range /
+        hyperslice reads.
+
+        Parameters
+        ----------
+        granule_url : str
+            Same URL that was passed to ``read_coordinates``.
+        group_index : int
+            Index into the list returned by ``read_coordinates``
+            (e.g. 0--5 for ATL06 ground tracks).
+        row_slice : slice
+            Bounding row range within the group that the caller
+            determined contains spatially relevant observations.
+            Implementations should read *at least* this range.
+        morton_indices : np.ndarray
+            Order-18 morton indices for the rows in ``row_slice``,
+            already masked to the parent cell.  Implementations must
+            include these (or a subset after quality filtering) as a
+            ``midx`` column in the returned DataFrame.
+
+        Returns
+        -------
+        pd.DataFrame or None
+            DataFrame with columns matching the schema's ``source`` and
+            ``weight_col`` fields (e.g. ``h_li``, ``s_li`` for ATL06)
+            plus a ``midx`` column of order-18 morton indices.
+            Return ``None`` if no rows survive quality filtering.
+        """
+        ...
 
 
 # ---------------------------------------------------------------------------

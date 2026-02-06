@@ -236,6 +236,333 @@ Target coverage: 1,872 cells covering Antarctic grounded ice drainage basins.
   └────────────────────────────────────────┘
 ```
 
+## Proposed: GranuleReader Protocol
+
+!!! note "Strawman Proposal"
+    This section describes a proposed refactoring, not the current implementation.
+    The protocol and ATL06Reader skeleton exist in the codebase for discussion.
+    See [`GranuleReader`][magg.processing.GranuleReader] and
+    [`ATL06Reader`][magg.atl06.ATL06Reader] API docs.
+
+`process_morton_cell` currently mixes two concerns: **data access** (ATL06 HDF5 structure, ground tracks, quality flags, h5coro credentials) and **generic aggregation** (spatial filtering, child cell grouping, schema-driven statistics). The [`GranuleReader`][magg.processing.GranuleReader] protocol separates these so the aggregation pipeline can be reused across datasets.
+
+### Protocol boundary
+
+```
+process_morton_cell(reader, parent_morton, ...)
+│
+│  Generic: morton spatial filtering + aggregation
+│  (processing.py --- unchanged across datasets)
+│
+│   For each granule_url:
+│   ┌─────────────────────────────────────────────────────────┐
+│   │  PHASE 1: Coordinates              ◄── reader protocol  │
+│   │  groups = reader.read_coordinates(url)                   │
+│   │  Returns [(lats, lons), ...] per observation group       │
+│   └────────────────────────┬────────────────────────────────┘
+│                            │
+│   ┌────────────────────────▼────────────────────────────────┐
+│   │  SPATIAL FILTER                     ◄── generic          │
+│   │  For each group:                                         │
+│   │    midx18 = geo2mort(lats, lons, order=18)               │
+│   │    mask = clip2order(parent_order, midx18) == parent      │
+│   │    row_slice = bounding range of mask                     │
+│   └────────────────────────┬────────────────────────────────┘
+│                            │
+│   ┌────────────────────────▼────────────────────────────────┐
+│   │  PHASE 2: Data + quality filter     ◄── reader protocol  │
+│   │  df = reader.read_data(url, group_idx, row_slice, midx)  │
+│   │  Returns DataFrame(value_col, weight_col, midx)          │
+│   │  or None if nothing passes quality filter                │
+│   └────────────────────────┬────────────────────────────────┘
+│                            │
+│   Concatenate all DataFrames
+│                            │
+│   ┌────────────────────────▼────────────────────────────────┐
+│   │  GROUP + AGGREGATE                  ◄── generic          │
+│   │  clip2order(child_order, midx_18)                        │
+│   │  For each child cell:                                    │
+│   │    calculate_cell_statistics()                            │
+│   │    (driven by CellStatsSchema metadata)                  │
+│   └────────────────────────┬────────────────────────────────┘
+│                            │
+│   ┌────────────────────────▼────────────────────────────────┐
+│   │  OUTPUT                             ◄── generic          │
+│   │  mort2healpix(children) → cell_ids                       │
+│   │  DataFrame(cell_ids, morton, count, h_min, ...)          │
+│   └─────────────────────────────────────────────────────────┘
+```
+
+### What changes per dataset
+
+| Concern | Where it lives | ATL06 | A hypothetical ATL03 |
+|---|---|---|---|
+| **File format** | `GranuleReader` impl | HDF5 via h5coro | HDF5 via h5coro |
+| **Observation groups** | `read_coordinates` | 6 ground tracks | 6 ground tracks |
+| **Dataset paths** | `read_coordinates`, `read_data` | `land_ice_segments/h_li` | `heights/h_ph` |
+| **Quality logic** | `read_data` | `quality_summary == 0` | `signal_conf_ph >= 3` |
+| **Value/weight cols** | `read_data` return cols | `h_li`, `s_li` | `h_ph`, (none) |
+| **Aggregation recipe** | `CellStatsSchema` | weighted mean + quantiles | count + quantiles |
+| **Spatial indexing** | `process_morton_cell` | unchanged | unchanged |
+| **Zarr output** | `write_dataframe_to_zarr` | unchanged | unchanged |
+
+### What stays generic
+
+Everything below the reader protocol is dataset-agnostic:
+
+- **Spatial filtering** --- `geo2mort`, `clip2order`, bounding-box hyperslice optimization
+- **Child cell grouping** --- `generate_morton_children`, group-by on clipped morton index
+- **Aggregation dispatch** --- `CellStatsSchema` metadata drives `AGG_FUNCTIONS`
+- **Zarr I/O** --- template creation from schema, chunk-aligned writes
+- **Orchestration** --- catalog loading, credential management, parallel Lambda invocation
+
+### Proposed process_morton_cell signature
+
+```python
+def process_morton_cell(
+    reader: GranuleReader,    # ← injected, replaces h5coro_driver + credentials
+    parent_morton: int,
+    parent_order: int,
+    child_order: int,
+    granule_urls: list[str],
+) -> tuple[pd.DataFrame, ProcessingMetadata]:
+    ...
+```
+
+The caller (Lambda handler or local script) constructs the appropriate reader and passes it in:
+
+```python
+# ATL06 on AWS Lambda
+reader = ATL06Reader(s3_credentials)
+df, meta = process_morton_cell(reader, parent_morton, ...)
+
+# Hypothetical ATL03
+reader = ATL03Reader(s3_credentials)
+df, meta = process_morton_cell(reader, parent_morton, ...)
+```
+
+## Optional: obspec-utils for Store Composition
+
+!!! note "Optional Enhancement"
+    This section describes how [obspec-utils](https://github.com/virtual-zarr/obspec-utils)
+    could improve observability and I/O performance. It does not require changes to the
+    aggregation pipeline itself.
+
+The current pipeline uses h5coro's built-in S3 driver for byte-range access to HDF5 files. obspec-utils provides composable, protocol-based store wrappers that could sit *underneath* any `GranuleReader` implementation, adding caching, request tracing, and concurrent fetching without changing the reader's logic.
+
+### Composable store stack
+
+obspec-utils wrappers are transparent proxies --- each implements the same `ReadableStore` protocol and forwards to an inner store. They can be stacked in any order:
+
+```
+GranuleReader.read_coordinates() / .read_data()
+        │
+        ▼
+┌─────────────────────────────────┐
+│ h5py.File(reader)               │  ◄── file-like interface
+│ or h5coro.H5Coro(driver)        │
+└───────────────┬─────────────────┘
+                │
+┌───────────────▼─────────────────┐
+│ EagerStoreReader                │  ◄── obspec-utils reader
+│ Fetches full dataset via        │      (concurrent range requests)
+│ concurrent get_ranges()         │
+│ Default: 12 MB chunks × 18     │
+│ parallel requests               │
+└───────────────┬─────────────────┘
+                │
+┌───────────────▼─────────────────┐
+│ CachingReadableStore            │  ◄── obspec-utils wrapper
+│ LRU cache for repeated reads    │      (optional)
+│ Thread-safe, configurable size  │
+└───────────────┬─────────────────┘
+                │
+┌───────────────▼─────────────────┐
+│ TracingReadableStore            │  ◄── obspec-utils wrapper
+│ Records every byte-range        │      (development only)
+│ request for profiling           │
+└───────────────┬─────────────────┘
+                │
+┌───────────────▼─────────────────┐
+│ obstore.S3Store                 │  ◄── concrete store
+│ Rust-based object_store crate   │
+└─────────────────────────────────┘
+```
+
+### Where each wrapper helps
+
+| Wrapper | What it does | When it helps |
+|---|---|---|
+| `EagerStoreReader` | Fetches a file via parallel `get_ranges()` instead of sequential reads | HDF5 metadata parsing (h5py needs many small seeks; fetching the whole header region in parallel is faster) |
+| `CachingReadableStore` | LRU cache of full objects, thread-safe | When the same granule appears in multiple parent cells (border cells share granules). Within a single Lambda this doesn't help, but in a local multi-threaded run it avoids redundant S3 fetches |
+| `TracingReadableStore` | Logs every `get`, `get_range`, `get_ranges` call with path, offset, length, and duration | Profiling byte-range access patterns to identify I/O bottlenecks; understanding how many requests h5coro makes per granule |
+| `SplittingReadableStore` | Splits large `get()` calls into concurrent `get_ranges()` | Large single-object downloads where the default `get()` is single-threaded |
+
+### Example: profiling h5coro access patterns
+
+```python
+from obspec_utils.wrappers import TracingReadableStore, RequestTrace
+from obstore.store import S3Store
+
+trace = RequestTrace()
+base = S3Store("nsidc-cumulus-prod-protected", region="us-west-2")
+traced = TracingReadableStore(base, trace)
+
+# Pass traced store to a GranuleReader that uses obstore instead of h5coro
+reader = ATL06Reader(credentials, store=traced)
+reader.read_coordinates("s3://nsidc-cumulus.../ATL06_...h5")
+
+# Inspect access pattern
+df = trace.to_dataframe()
+print(df[["path", "offset", "length", "duration_ms"]])
+print(trace.summary())  # total_requests, total_bytes, avg_latency
+```
+
+### Fit with the GranuleReader protocol
+
+The store stack is an *implementation detail* of a `GranuleReader`. The protocol doesn't prescribe how bytes are fetched --- a reader could use h5coro, obstore, or fsspec internally. obspec-utils becomes relevant when building a reader backed by obstore:
+
+```python
+class ObstoreATL06Reader:
+    """ATL06Reader using obstore + obspec-utils instead of h5coro."""
+
+    def __init__(self, store: ReadableStore):
+        self._store = store
+
+    def read_coordinates(self, granule_url):
+        reader = EagerStoreReader(self._store, granule_url)
+        with h5py.File(reader, "r") as f:
+            ...  # same ground-track logic as ATL06Reader
+```
+
+## Optional: VirtualiZarr for Pre-Computed References
+
+!!! note "Optional Enhancement"
+    This section describes how [VirtualiZarr](https://github.com/zarr-developers/VirtualiZarr)
+    could eliminate per-invocation HDF5 metadata parsing by pre-computing byte-range
+    references. This is a larger architectural change that replaces the catalog + h5coro
+    read path.
+
+### The current cost model
+
+Each Lambda invocation pays two costs per granule:
+
+1. **Metadata parsing** --- h5coro reads the HDF5 superblock and B-tree to locate datasets. This requires multiple small S3 range requests before any data is read.
+2. **Data reading** --- h5coro fetches the actual dataset bytes via hyperslice.
+
+For a parent cell that touches 20 granules × 6 ground tracks, that is 120 metadata-parse operations per Lambda, each requiring several S3 round trips. The data reads are unavoidable, but the metadata parsing is *identical every time the same granule is processed* --- it only depends on the file structure, not on which parent cell is being queried.
+
+### How VirtualiZarr eliminates redundant parsing
+
+VirtualiZarr parses each HDF5 file *once* and records the byte offsets of every chunk in a `ChunkManifest`. Subsequent access skips all HDF5 metadata parsing and reads data chunks directly by offset.
+
+```
+CURRENT PIPELINE (per Lambda):
+
+  granule.h5 on S3
+       │
+       ▼
+  h5coro: parse superblock ──── S3 range requests (metadata)
+       │
+       ▼
+  h5coro: walk B-tree ───────── S3 range requests (metadata)
+       │
+       ▼
+  h5coro: read dataset ──────── S3 range request  (data)
+
+
+WITH VIRTUALIZARR (one-time setup + per Lambda):
+
+  Step 0 (once):
+  ┌──────────────────────────────────────────────────┐
+  │ open_virtual_mfdataset(all 2,000 granules)       │
+  │   ├─ Parse each HDF5 header (parallelizable)     │
+  │   ├─ Record chunk byte offsets in ChunkManifest   │
+  │   └─ Persist to Icechunk store                   │
+  │                                                  │
+  │ Output: {dataset_path: [(file, offset, len),...]} │
+  │ Size:   ~100 MB of references for 2,000 granules  │
+  └──────────────────────────────────────────────────┘
+
+  Per Lambda:
+  ┌──────────────────────────────────────────────────┐
+  │ Open Icechunk store (instant, cached metadata)   │
+  │       │                                          │
+  │       ▼                                          │
+  │ Look up chunk offsets for needed datasets         │
+  │ (no HDF5 parsing, no S3 metadata round trips)    │
+  │       │                                          │
+  │       ▼                                          │
+  │ Direct S3 range request to known offset ── data  │
+  └──────────────────────────────────────────────────┘
+```
+
+### What changes
+
+| Aspect | Current | With VirtualiZarr |
+|---|---|---|
+| **Catalog** | `{morton: [s3_urls]}` | `{morton: [s3_urls]}` + Icechunk reference store |
+| **Per-Lambda HDF5 parsing** | 120 metadata-parse ops (20 granules × 6 tracks) | 0 --- offsets pre-computed |
+| **Per-Lambda S3 round trips** | ~5 metadata + 1 data per track per granule | 1 data per track per granule |
+| **One-time setup cost** | Catalog build (~30s) | Catalog build + virtualization (~10--30 min, parallelizable) |
+| **Reader implementation** | h5coro with S3 driver | obstore with pre-computed offsets (or ManifestStore) |
+| **Granule format changes** | Re-run pipeline | Re-run virtualization |
+
+### Proposed integration
+
+VirtualiZarr would add a new preparation step between catalog building and Lambda execution:
+
+```
+1. BUILD CATALOG  ──────────────────────── (unchanged)
+        │
+        ▼
+2. VIRTUALIZE GRANULES  ──────────────────  (new step)
+   open_virtual_mfdataset(all_granule_urls)
+   Persist to Icechunk
+        │
+        ▼
+3. CREATE ZARR TEMPLATE  ─────────────────  (unchanged)
+        │
+        ▼
+4. PARALLEL EXECUTION  ───────────────────  (reader changes)
+   Each Lambda:
+     Open Icechunk reference store
+     Look up byte offsets for needed datasets
+     Read data via direct S3 range requests
+        │
+        ▼
+5. CONSOLIDATE  ──────────────────────────  (unchanged)
+```
+
+The `GranuleReader` protocol accommodates this naturally --- a `VirtualATL06Reader` would look up chunk offsets from the Icechunk store instead of parsing HDF5 metadata:
+
+```python
+class VirtualATL06Reader:
+    """ATL06Reader backed by pre-computed VirtualiZarr references."""
+
+    def __init__(self, icechunk_store, s3_store):
+        self._manifest = xr.open_zarr(icechunk_store)
+        self._store = s3_store
+
+    def read_coordinates(self, granule_url):
+        # Read lat/lon via pre-computed byte offsets
+        # No HDF5 metadata parsing needed
+        ...
+
+    def read_data(self, granule_url, group_index, row_slice, morton_indices):
+        # Direct range request to known offset + length
+        ...
+```
+
+### When virtualization is worth it
+
+Virtualization adds a one-time setup cost but eliminates per-invocation overhead. The tradeoff depends on how many times the same granules are processed:
+
+- **Single cycle, single run** --- marginal benefit. The 10--30 minute virtualization cost is comparable to the metadata overhead across 1,700 Lambdas.
+- **Multiple runs on the same cycle** (parameter tuning, schema changes, debugging) --- clear win. Metadata parsing is done once, every subsequent run is faster.
+- **Multi-cycle analysis** --- strong win. Virtualize each cycle once, re-aggregate as needed.
+- **Adding new aggregation variables** --- strong win. The data is already referenced; only the `CellStatsSchema` and `AGG_FUNCTIONS` change.
+
 ## Key Design Decisions
 
 **Why one chunk per parent cell?** Each Lambda writes to exactly one chunk of the Zarr store. Since chunks are the atomic unit of Zarr writes, 1,700+ workers can write concurrently without coordination or locking.

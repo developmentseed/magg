@@ -1,6 +1,10 @@
 # Processing
 
-The processing module contains the core aggregation pipeline: reading HDF5 data from S3, spatial filtering by morton cell, computing statistics, and writing results to Zarr.
+The processing module contains the core aggregation pipeline: spatial filtering by morton cell, computing statistics, and writing results to Zarr.
+
+## Granule Reader Protocol
+
+::: magg.processing.GranuleReader
 
 ## Pipeline
 
